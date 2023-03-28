@@ -13,11 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Fine-tuning the library models for language modeling on a text file (GPT, GPT-2, BERT, RoBERTa).
-GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
-using a masked language modeling (MLM) loss.
-"""
 
 from __future__ import absolute_import, division, print_function
 
@@ -29,7 +24,8 @@ import pickle
 import random
 import re
 import shutil
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from pytorchtools import EarlyStopping
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
@@ -49,7 +45,9 @@ from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
                           GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
                           OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                           RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
-                          DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
+                          DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer, AutoConfig, RobertaModel)
+import torch.optim.lr_scheduler as lr_scheduler
+from transformers import EarlyStoppingCallback
 
 logger = logging.getLogger(__name__)
 
@@ -61,32 +59,29 @@ MODEL_CLASSES = {
     'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 }
 
-
-
 class InputFeatures(object):
-    """A single training/test features for a example."""
+   # """A single training/test features for a example."""
     def __init__(self,
                  input_tokens,
                  input_ids,
                  idx,
                  label,
-
+    
     ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
         self.idx=str(idx)
         self.label=label
 
-        
 def convert_examples_to_features(js,tokenizer,args):
-    #source
-    code=' '.join(js['func'].split())
+    code=' '.join(js['function'].split())
     code_tokens=tokenizer.tokenize(code)[:args.block_size-2]
     source_tokens =[tokenizer.cls_token]+code_tokens+[tokenizer.sep_token]
     source_ids =  tokenizer.convert_tokens_to_ids(source_tokens)
     padding_length = args.block_size - len(source_ids)
     source_ids+=[tokenizer.pad_token_id]*padding_length
     return InputFeatures(source_tokens,source_ids,js['idx'],js['target'])
+
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer, args, file_path=None):
@@ -108,8 +103,7 @@ class TextDataset(Dataset):
 
     def __getitem__(self, i):       
         return torch.tensor(self.examples[i].input_ids),torch.tensor(self.examples[i].label)
-            
-
+     
 def set_seed(seed=42):
     random.seed(seed)
     os.environ['PYHTONHASHSEED'] = str(seed)
@@ -118,20 +112,20 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-
 def train(args, train_dataset, model, tokenizer):
-    """ Train the model """ 
+   # """ Train the model """
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
                                   batch_size=args.train_batch_size,num_workers=4,pin_memory=True)
-    args.max_steps=args.epoch*len( train_dataloader)
     args.save_steps=len( train_dataloader)
     args.warmup_steps=len( train_dataloader)
     args.logging_steps=len( train_dataloader)
     args.num_train_epochs=args.epoch
+    args.early_stopping_patience = 3
     model.to(args.device)
+    
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -139,9 +133,14 @@ def train(args, train_dataset, model, tokenizer):
          'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.max_steps*0.1,
-                                                num_training_steps=args.max_steps)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=len(train_dataset) * args.num_train_epochs // args.train_batch_size)
+    early_stopping = EarlyStopping(patience=args.early_stopping_patience, verbose=True)
+
+    if args.early_stopping_patience is not None:
+        early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)
+
     if args.fp16:
         try:
             from apex import amp
@@ -166,7 +165,8 @@ def train(args, train_dataset, model, tokenizer):
         scheduler.load_state_dict(torch.load(scheduler_last))
     if os.path.exists(optimizer_last):
         optimizer.load_state_dict(torch.load(optimizer_last))
-    # Train!
+
+   # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
@@ -177,28 +177,32 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", args.max_steps)
     
-    global_step = args.start_step
+    global_step = 0
     tr_loss, logging_loss,avg_loss,tr_nb,tr_num,train_loss = 0.0, 0.0,0.0,0,0,0
     best_mrr=0.0
     best_acc=0.0
-    # model.resize_token_embeddings(len(tokenizer))
     model.zero_grad()
- 
-    for idx in range(args.start_epoch, int(args.num_train_epochs)): 
-        bar = tqdm(train_dataloader,total=len(train_dataloader))
-        tr_num=0
-        train_loss=0
-        for step, batch in enumerate(bar):
-            inputs = batch[0].to(args.device)        
-            labels=batch[1].to(args.device) 
-            model.train()
-            loss,logits = model(inputs,labels)
+    stop_training=False
+    output_flag=False
+    early_stop_count = 0
+    early_stop_best_loss = float('inf')
+    while early_stop_count < args.early_stopping_patience and not stop_training:
+        for idx in range(args.start_epoch, int(args.num_train_epochs)): 
+            bar = tqdm(train_dataloader,total=len(train_dataloader))
+            tr_num=0
+            train_loss=0
+            
+            for step, batch in enumerate(bar):
+                inputs = batch[0].to(args.device)        
+                labels=batch[1].to(args.device) 
+                model.train()
+                loss,logits = model(inputs,labels)
 
+                if args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-            if args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
 
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -208,19 +212,23 @@ def train(args, train_dataset, model, tokenizer):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-            tr_loss += loss.item()
-            tr_num+=1
-            train_loss+=loss.item()
-            if avg_loss==0:
-                avg_loss=tr_loss
-            avg_loss=round(train_loss/tr_num,5)
-            bar.set_description("epoch {} loss {}".format(idx,avg_loss))
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
-                
+                tr_loss += loss.item()
+                tr_num+=1
+                train_loss+=loss.item()
+                if avg_loss==0:
+                    avg_loss=tr_loss
+                avg_loss=round(train_loss/tr_num,5)
+                bar.set_description("epoch {} loss {}".format(idx,avg_loss))
+
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()  
+                scheduler.step()
                 global_step += 1
                 output_flag=True
                 avg_loss=round(np.exp((tr_loss - logging_loss) /(global_step- tr_nb)),4)
@@ -229,30 +237,67 @@ def train(args, train_dataset, model, tokenizer):
                     tr_nb=global_step
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    
+
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer,eval_when_training=True)
                         for key, value in results.items():
-                            logger.info("  %s = %s", key, round(value,4))                    
-                        # Save model checkpoint
-                        
-                    if results['eval_acc']>best_acc:
-                        best_acc=results['eval_acc']
-                        logger.info("  "+"*"*20)  
-                        logger.info("  Best acc:%s",round(best_acc,4))
-                        logger.info("  "+"*"*20)                          
-                        
-                        checkpoint_prefix = 'checkpoint-best-acc'
-                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
-                        if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)                        
-                        model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format('model.bin')) 
-                        torch.save(model_to_save.state_dict(), output_dir)
-                        logger.info("Saving model checkpoint to %s", output_dir)
-                        
+                            logger.info("  %s = %s", key, round(value,4))
 
 
+
+                            # Save model checkpoint if it's the best one so far
+                            if results['eval_loss'] < early_stop_best_loss and abs(results['eval_loss'] - early_stop_best_loss) > 0.001:
+                                best_acc = results['eval_acc']
+                                logger.info("  "+"*"*20)
+                                logger.info("  Best acc:%s",round(best_acc,4))
+                                logger.info("  " + "*" * 20)
+                                early_stop_best_loss = results['eval_loss']
+                                logger.info("  " + "*" * 20)
+                                logger.info("  Best loss:%s", round(early_stop_best_loss, 4))
+                                logger.info("  " + "*" * 20)
+                                checkpoint_prefix = 'checkpoint-best-acc'
+                                checkpoint_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+                                output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+                                if not os.path.exists(output_dir):
+                                    os.makedirs(output_dir)
+
+                                # Load the config file
+                                config_path = os.path.join("saved_models", "model.config")
+                                config = RobertaConfig.from_pretrained(config_path)
+
+                                # Save the pretrained model
+                                model_to_save = model.module if hasattr(model,'module') else model
+                                output_dir = os.path.join(output_dir, '{}'.format('model.bin'))
+                                torch.save(model_to_save.state_dict(), output_dir)
+                                logger.info("Saving model checkpoint to %s", output_dir)
+                                # Save the config file
+                                config.save_pretrained(checkpoint_dir)
+
+                                early_stop_count = 0 # reset early stopping counter
+                            # Early stopping mechanism
+                            else:
+                                early_stop_count +=1
+                                if early_stop_count == args.early_stopping_patience:
+                                    logger.info("  "+"*"*20)
+                                    logger.info("  Early stopping triggered!")
+                                    stop_training = True  # set flag to stop outer loop
+                                    break  # exit inner loop
+            if stop_training:  # exit outer loop
+                break
+    
+    # Load the best saved model checkpoint
+    checkpoint_prefix = 'checkpoint-best-acc'
+    output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    model = RobertaForSequenceClassification.from_pretrained("saved_models/model_bert", config=config)
+    tokenizer = RobertaTokenizer.from_pretrained("saved_models/tokenizer_bert")
+
+    # Save the best trained model and tokenizer
+    config = AutoConfig.from_pretrained(checkpoint_dir)
+    model.save_pretrained("trained_model/roberta_model")
+    tokenizer.save_pretrained("trained_model/roberta_model")
 
 def evaluate(args, model, tokenizer,eval_when_training=False):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
@@ -338,11 +383,11 @@ def test(args, model, tokenizer):
     labels=np.concatenate(labels,0)
     preds=logits[:,0]>0.5
     with open(os.path.join(args.output_dir,"predictions.txt"),'w') as f:
-        for example,pred in zip(eval_dataset.examples,preds):
-            if pred:
-                f.write(example.idx+'\t1\n')
-            else:
-                f.write(example.idx+'\t0\n')    
+        for example,logit in zip(eval_dataset.examples,logits):
+            #if pred:
+                f.write(example.idx+'\t' + str(logit) + '\n')
+           # else:
+            #    f.write(example.idx+'\t0\n')    
     
                         
                         
@@ -474,7 +519,6 @@ def main():
                    args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
 
 
-
     # Set seed
     set_seed(args.seed)
 
@@ -513,6 +557,7 @@ def main():
         model = model_class.from_pretrained(args.model_name_or_path,
                                             from_tf=bool('.ckpt' in args.model_name_or_path),
                                             config=config,
+                                            ignore_mismatched_sizes=True,
                                             cache_dir=args.cache_dir if args.cache_dir else None)    
     else:
         model = model_class(config)

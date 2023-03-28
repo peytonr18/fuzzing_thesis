@@ -2,13 +2,13 @@
 # Licensed under the MIT License.
 import torch
 import torch.nn as nn
-import torch
 from torch.autograd import Variable
 import copy
 from torch.nn import CrossEntropyLoss, MSELoss
+import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer
 
-    
-    
+
 class Model(nn.Module):   
     def __init__(self, encoder,config,tokenizer,args):
         super(Model, self).__init__()
@@ -29,4 +29,6 @@ class Model(nn.Module):
             return loss,prob
         else:
             return prob
-      
+
+
+

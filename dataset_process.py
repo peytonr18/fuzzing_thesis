@@ -11,34 +11,34 @@ train_index=set()
 validate_index=set()
 test_index=set()
 
-with open('/Users/peytonrobertson/fuzzing_thesis/train.txt') as f:
+with open('train.txt') as f:
     for line in f:
         line=line.strip()
         train_index.add(int(line))
                     
-with open('/Users/peytonrobertson/fuzzing_thesis/validate.txt') as f:
+with open('validate.txt') as f:
     for line in f:
         line=line.strip()
         validate_index.add(int(line))
         
-with open('/Users/peytonrobertson/fuzzing_thesis/test.txt') as f:
+with open('test.txt') as f:
     for line in f:
         line=line.strip()
         test_index.add(int(line))
     
-with open('/Users/peytonrobertson/fuzzing_thesis/train.json','w') as f:
+with open('train.json','w') as f:
     for idx,js in enumerate(vulnDB):
         if idx in train_index:
             js['idx']=idx
             f.write(json.dumps(js)+'\n')
             
-with open('/Users/peytonrobertson/fuzzing_thesis/validate.json','w') as f:
+with open('validate.json','w') as f:
     for idx,js in enumerate(vulnDB):
         if idx in validate_index:
             js['idx']=idx
             f.write(json.dumps(js)+'\n')
             
-with open('/Users/peytonrobertson/fuzzing_thesis/test.json','w') as f:
+with open('test.json','w') as f:
     for idx,js in enumerate(vulnDB):
         if idx in test_index:
             js['idx']=idx

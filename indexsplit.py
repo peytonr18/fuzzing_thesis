@@ -6,8 +6,7 @@ import json
 df = pd.read_json('function_new.json')
 df2 = pd.DataFrame(df)
 
-df = df.rename({'func' : 'function'}, axis=1)
-df = df['function'].apply(lambda x: x.replace('\n', ''))
+df = df['func'].apply(lambda x: x.replace('\n', ''))
 
 training_data = df.sample(frac=0.7, random_state=25)
 testing_data = df.drop(training_data.index)
@@ -37,3 +36,4 @@ with open('test.txt', 'w') as f:
 with open('validate.txt', 'w') as f:
 	for i, index in enumerate(validation_data.index):
 		f.write(str(index) + '\n')
+
